@@ -604,6 +604,16 @@ void ConversionsTest::TestTypesConversion(const Type &inType,
                     gMinVectorSize = 0;
             }
 
+            //do here the multithreadhing thing
+            /*********************************************************************************** */
+
+
+
+
+
+
+            /*********************************************************************************** */
+
             if ((error = DoTest<InType, OutType, InFP, OutFP>(outType, inType,
                                                               sat, round)))
             {
@@ -615,6 +625,217 @@ void ConversionsTest::TestTypesConversion(const Type &inType,
             }
         }
     }
+}
+
+struct ThreadTestData {
+    DataInitBase* dataInit;
+    WriteInputBufferInfo* writeInfo;
+};
+
+void FixNanConversions(Type outType, Type inType, void *d, cl_uint count,
+                       void *inp);
+
+template <typename InType, typename OutType, bool InFP, bool OutFP>
+cl_int run_multithread_test(cl_uint job_id, cl_uint thread_id, void *data)
+{
+    cl_int error;
+    DataInitBase *info = static_cast<ThreadTestData*>(data)->dataInit;//(DataInitBase *)data;
+    void *pIn = (char *)gIn + job_id * info->size * gTypeSizes[info->inType];
+
+    // Copy the results to the device
+    if ((error = clEnqueueWriteBuffer(gQueue, gInBuffer, CL_TRUE, 0,
+                                        info->size * gTypeSizes[info->inType], pIn, 0,
+                                        NULL, NULL)))
+    {
+        vlog_error("ERROR: clEnqueueWriteBuffer failed. (%d)\n", error);
+        gFailCount++;
+        return error;
+    }
+
+    // Call completion callback for the write, which will enqueue the rest
+    // of the work.
+    //conv_test::WriteInputBufferComplete((void *)&writeInputBufferInfo);
+
+
+    cl_int status;
+    WriteInputBufferInfo *write_info = static_cast<ThreadTestData*>(data)->writeInfo;
+    int vectorSize;
+
+    for (vectorSize = gMinVectorSize; vectorSize < gMaxVectorSize; vectorSize++)
+    {
+        size_t workItemCount =
+            (write_info->count + vectorSizes[vectorSize] - 1) / (vectorSizes[vectorSize]);
+
+        if ((status = conv_test::RunKernel(write_info->calcInfo[vectorSize]->kernel,
+                                           gInBuffer, gOutBuffers[vectorSize],
+                                           workItemCount)))
+        {
+            gFailCount++;
+            return -1;
+        }
+
+        write_info->calcInfo[vectorSize]->p = clEnqueueMapBuffer(
+            gQueue, gOutBuffers[vectorSize], CL_TRUE,
+            CL_MAP_READ | CL_MAP_WRITE, 0, write_info->count * gTypeSizes[write_info->outType], 0,
+            NULL, NULL, &status);
+        {
+            if (status)
+            {
+                vlog_error("ERROR: WriteInputBufferComplete calback failed "
+                           "with status: %d\n",
+                           status);
+                gFailCount++;
+                return -1;
+            }
+        }
+    }
+
+    // Make sure the work starts moving -- otherwise we may deadlock
+    if ((status = clFinish(gQueue)))
+    {
+        vlog_error(
+            "ERROR: WriteInputBufferComplete calback failed with status: %d\n",
+            status);
+        gFailCount++;
+        return -1;
+    }
+
+    //////////////////////////////////////////////////////////////
+    //should complete calculate ref values here
+    cl_uint count = info->size;
+    Type inType = info->inType;
+    Type outType = info->outType;
+    RoundingMode round = info->round;
+
+    Force64BitFPUPrecision();
+
+    void *s = (cl_uchar *)gIn + job_id * count * gTypeSizes[info->inType];
+    void *a = (cl_uchar *)gAllowZ + job_id * count;
+    void *d = (cl_uchar *)gRef + job_id * count * gTypeSizes[info->outType];
+
+    if (outType != inType)
+    {
+        // create the reference while we wait
+#if (defined(__arm__) || defined(__aarch64__)) && defined(__GNUC__)
+        /* ARM VFP doesn't have hardware instruction for converting from 64-bit
+         * integer to float types, hence GCC ARM uses the floating-point
+         * emulation code despite which -mfloat-abi setting it is. But the
+         * emulation code in libgcc.a has only one rounding mode (round to
+         * nearest even in this case) and ignores the user rounding mode setting
+         * in hardware. As a result setting rounding modes in hardware won't
+         * give correct rounding results for type covert from 64-bit integer to
+         * float using GCC for ARM compiler so for testing different rounding
+         * modes, we need to use alternative reference function. ARM64 does have
+         * an instruction, however we cannot guarantee the compiler will use it.
+         * On all ARM architechures use emulation to calculate reference.*/
+        switch (round)
+        {
+            /* conversions to floating-point type use the current rounding mode.
+             * The only default floating-point rounding mode supported is round
+             * to nearest even i.e the current rounding mode will be _rte for
+             * floating-point types. */
+            case kDefaultRoundingMode: qcom_rm = qcomRTE; break;
+            case kRoundToNearestEven: qcom_rm = qcomRTE; break;
+            case kRoundUp: qcom_rm = qcomRTP; break;
+            case kRoundDown: qcom_rm = qcomRTN; break;
+            case kRoundTowardZero: qcom_rm = qcomRTZ; break;
+            default:
+                vlog_error("ERROR: undefined rounding mode %d\n", round);
+                break;
+        }
+        qcom_sat = info->sat;
+#endif
+
+        RoundingMode oldRound;
+        if (outType == khalf)
+        {
+            oldRound = set_round(kRoundToNearestEven, kfloat);
+            switch (round)
+            {
+                default:
+                case kDefaultRoundingMode:
+                    DataInitInfo::halfRoundingMode =
+                        ConversionsTest::defaultHalfRoundingMode;
+                    break;
+                case kRoundToNearestEven:
+                    DataInitInfo::halfRoundingMode = CL_HALF_RTE;
+                    break;
+                case kRoundUp:
+                    DataInitInfo::halfRoundingMode = CL_HALF_RTP;
+                    break;
+                case kRoundDown:
+                    DataInitInfo::halfRoundingMode = CL_HALF_RTN;
+                    break;
+                case kRoundTowardZero:
+                    DataInitInfo::halfRoundingMode = CL_HALF_RTZ;
+                    break;
+            }
+        }
+        else
+            oldRound = set_round(round, outType);
+
+        if (info->sat)
+            info->conv_array_sat(d, s, count);
+        else
+            info->conv_array(d, s, count);
+
+        set_round(oldRound, outType);
+
+        // Decide if we allow a zero result in addition to the correctly rounded
+        // one
+        memset(a, 0, count);
+        if (gForceFTZ && (inType == kfloat || outType == kfloat))
+        {
+            info->set_allow_zero_array((uint8_t *)a, d, s, count);
+        }
+        if (gForceHalfFTZ && (inType == khalf || outType == khalf))
+        {
+            info->set_allow_zero_array((uint8_t *)a, d, s, count);
+        }
+    }
+    else
+    {
+        // Copy the input to the reference
+        memcpy(d, s, info->size * gTypeSizes[inType]);
+    }
+
+    // Patch up NaNs conversions to integer to zero -- these can be converted to
+    // any integer
+    FixNanConversions(outType, inType, d, count, s);
+
+    //////////////////////////////////////////////////////////////
+    // check the results 
+    cl_int res_error;
+    for (vectorSize = gMinVectorSize; vectorSize < gMaxVectorSize; vectorSize++)
+    {
+        std::unique_ptr<CalcRefValsBase> &calc_info = write_info->calcInfo[vectorSize];
+        FixNanConversions(calc_info->parent->outType, calc_info->parent->inType, calc_info->p, count, gIn);
+
+        if (memcmp(calc_info->p, gRef, count * gTypeSizes[calc_info->parent->outType]))
+            calc_info->result =
+                calc_info->check_result(calc_info->p, count, vectorSizes[vectorSize]);
+        else
+            calc_info->result = 0;
+                // Fill the output buffer with junk and release it
+        {
+            cl_uint pattern = 0xffffdead;
+            memset_pattern4(calc_info->p, &pattern, count * gTypeSizes[calc_info->parent->outType]);
+            if ((res_error = clEnqueueUnmapMemObject(gQueue, gOutBuffers[vectorSize],
+                                                calc_info->p, 0, NULL, NULL)))
+            {
+                vlog_error("ERROR: clEnqueueUnmapMemObject failed in "
+                        "CalcReferenceValuesComplete  (%d)\n",
+                        error);
+                gFailCount++;
+            }
+        }
+    }
+  
+
+
+
+
+    return CL_SUCCESS;
 }
 
 template <typename InType, typename OutType, bool InFP, bool OutFP>
@@ -714,49 +935,6 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
         cl_uint count = (uint32_t)std::min((uint64_t)blockCount, lastCase - i);
         writeInputBufferInfo.count = count;
 
-        // Crate a user event to represent the status of the reference value
-        // computation completion
-        writeInputBufferInfo.calcReferenceValues =
-            clCreateUserEvent(gContext, &error);
-        if (error || NULL == writeInputBufferInfo.calcReferenceValues)
-        {
-            vlog_error("ERROR: Unable to create user event. (%d)\n", error);
-            gFailCount++;
-            return error;
-        }
-
-        // retain for consumption by MapOutputBufferComplete
-        for (vectorSize = gMinVectorSize; vectorSize < gMaxVectorSize;
-             vectorSize++)
-        {
-            if ((error =
-                     clRetainEvent(writeInputBufferInfo.calcReferenceValues)))
-            {
-                vlog_error("ERROR: Unable to retain user event. (%d)\n", error);
-                gFailCount++;
-                return error;
-            }
-        }
-
-        // Crate a user event to represent when the callbacks are done verifying
-        // correctness
-        writeInputBufferInfo.doneBarrier = clCreateUserEvent(gContext, &error);
-        if (error || NULL == writeInputBufferInfo.doneBarrier)
-        {
-            vlog_error("ERROR: Unable to create user event for barrier. (%d)\n",
-                       error);
-            gFailCount++;
-            return error;
-        }
-
-        // retain for use by the callback that calls this
-        if ((error = clRetainEvent(writeInputBufferInfo.doneBarrier)))
-        {
-            vlog_error("ERROR: Unable to retain user event doneBarrier. (%d)\n",
-                       error);
-            gFailCount++;
-            return error;
-        }
 
         //      Call this in a multithreaded manner
         cl_uint chunks = RoundUpToNextPowerOfTwo(threads) * 2;
@@ -775,64 +953,17 @@ int ConversionsTest::DoTest(Type outType, Type inType, SaturationMode sat,
 
         ThreadPool_Do(conv_test::InitData, chunks, &init_info);
 
-        // Copy the results to the device
-        if ((error = clEnqueueWriteBuffer(gQueue, gInBuffer, CL_TRUE, 0,
-                                          count * gTypeSizes[inType], gIn, 0,
-                                          NULL, NULL)))
-        {
-            vlog_error("ERROR: clEnqueueWriteBuffer failed. (%d)\n", error);
-            gFailCount++;
-            return error;
-        }
+        ThreadTestData thread_data{ &init_info, &writeInputBufferInfo };
+        ThreadPool_Do(
+            run_multithread_test<InType, OutType, InFP, OutFP>, chunks,
+            &thread_data);
 
-        // Call completion callback for the write, which will enqueue the rest
-        // of the work.
-        conv_test::WriteInputBufferComplete((void *)&writeInputBufferInfo);
+   
+         
 
-        // Make sure the work is actually running, so we don't deadlock
-        if ((error = clFlush(gQueue)))
-        {
-            vlog_error("clFlush failed with error %d\n", error);
-            gFailCount++;
-            return error;
-        }
+        
 
-        ThreadPool_Do(conv_test::PrepareReference, chunks, &init_info);
-
-        // signal we are done calculating the reference results
-        if ((error = clSetUserEventStatus(
-                 writeInputBufferInfo.calcReferenceValues, CL_COMPLETE)))
-        {
-            vlog_error(
-                "Error:  Failed to set user event status to CL_COMPLETE:  %d\n",
-                error);
-            gFailCount++;
-            return error;
-        }
-
-        // Wait for the event callbacks to finish verifying correctness.
-        if ((error = clWaitForEvents(
-                 1, (cl_event *)&writeInputBufferInfo.doneBarrier)))
-        {
-            vlog_error("Error:  Failed to wait for barrier:  %d\n", error);
-            gFailCount++;
-            return error;
-        }
-
-        if ((error = clReleaseEvent(writeInputBufferInfo.calcReferenceValues)))
-        {
-            vlog_error("Error:  Failed to release calcReferenceValues:  %d\n",
-                       error);
-            gFailCount++;
-            return error;
-        }
-
-        if ((error = clReleaseEvent(writeInputBufferInfo.doneBarrier)))
-        {
-            vlog_error("Error:  Failed to release done barrier:  %d\n", error);
-            gFailCount++;
-            return error;
-        }
+        
 
         for (vectorSize = gMinVectorSize; vectorSize < gMaxVectorSize;
              vectorSize++)
